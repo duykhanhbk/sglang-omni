@@ -118,27 +118,38 @@ class SpeechifyTTSEngine:
         self.voice_extractor.set_vae(self.vocoder.input_layer)
 
     @torch.inference_mode()
-    def warmup(self, texts: tuple[str, ...] = (
-        "Hello there, this is a short warmup utterance.",
-        "This is a slightly longer warmup utterance that exercises the "
-        "autoregressive decode loop, the diffusion vocoder, and the speaker "
-        "tower so the very first real request does not pay cold CUDA costs.",
-    )) -> None:
-        """Run a couple of full ``synthesize`` passes through every stage (voice
-        extractor, encoder, AR loop, vocoder) so the first real request is not
-        ~4x slower paying one-time CUDA module-load / cuBLAS heuristic costs.
+    def warmup(self, passes: int = 3) -> None:
+        """Saturate every stage (voice extractor, encoder, AR decode loop,
+        diffusion vocoder, speaker tower) so the first real request does not pay
+        one-time CUDA module-load / cuBLAS heuristic / autotune costs.
+
+        The autoregressive decode loop needs a few *hundred* steps before its
+        per-step latency settles (cuBLAS picks steady-state heuristics, and
+        cuBLAS handles are per-thread -- so this must run on the same worker
+        thread that will serve requests). We therefore run several full-length
+        passes and drive each well past 400 decode steps.
 
         Uses a synthetic reference waveform (band-limited noise) so no reference
         file is required."""
         g = torch.Generator().manual_seed(0)
         ref = (torch.randn(3 * 24000, generator=g) * 0.05).clamp(-1, 1)
-        for txt in texts:
+        # A long warmup utterance so the AR loop generates many codes per pass
+        # (~500+), matching the steady-state regime real requests hit.
+        long_txt = (
+            "This is a deliberately long warmup utterance whose only purpose is "
+            "to drive the autoregressive decode loop through several hundred "
+            "steps so that the cuBLAS heuristics and every CUDA kernel reach "
+            "their steady state before the very first real request arrives, "
+            "which keeps the first user-visible synthesis just as fast as every "
+            "subsequent one instead of paying a large cold-start penalty."
+        )
+        for i in range(max(passes, 1)):
             try:
-                self.synthesize(txt, ref, max_new_tokens=256, seed=0)
+                self.synthesize(long_txt, ref, max_new_tokens=600, seed=0)
             except Exception as exc:  # noqa: BLE001
-                logger.warning("warmup pass failed (non-fatal): %s", exc)
+                logger.warning("warmup pass %d failed (non-fatal): %s", i, exc)
         torch.cuda.synchronize()
-        logger.info("SpeechifyTTS warmup complete (%d passes)", len(texts))
+        logger.info("SpeechifyTTS warmup complete (%d passes)", passes)
 
     @torch.inference_mode()
     def synthesize(

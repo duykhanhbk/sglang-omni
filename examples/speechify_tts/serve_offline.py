@@ -28,8 +28,6 @@ import base64
 import io
 import os
 import tempfile
-import threading
-
 import numpy as np
 import soundfile as sf
 import torch
@@ -45,9 +43,21 @@ def _build_app(model_path: str, device: str) -> FastAPI:
     app = FastAPI(title="SpeechifyTTS Offline Server")
     print(f"[serve_offline] loading engine from {model_path} on {device} ...")
     engine = SpeechifyTTSEngine(model_path, device=device)
-    print("[serve_offline] warming up CUDA kernels ...", flush=True)
-    engine.warmup()
-    lock = threading.Lock()  # single GPU pipeline; serialize requests
+
+    # Run ALL synthesis on one dedicated worker thread. Two reasons:
+    #  1) keeps the CPU-launch-bound decode loop off the asyncio event-loop
+    #     thread (GIL/event-loop contention otherwise inflates per-step latency
+    #     ~1.5x), and
+    #  2) cuBLAS handles are per-thread -- a single pinned thread means the
+    #     warmed handle/heuristics are reused for every request (Starlette's
+    #     default threadpool would route to many cold worker threads).
+    import concurrent.futures
+
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="tts-worker"
+    )
+    print("[serve_offline] warming up CUDA kernels (dedicated worker) ...", flush=True)
+    executor.submit(engine.warmup).result()
     print(f"[serve_offline] ready (sample_rate={engine.sample_rate})", flush=True)
 
     def _resolve_reference(ref: str) -> str:
@@ -81,14 +91,13 @@ def _build_app(model_path: str, device: str) -> FastAPI:
         rate_override = body.get("speaking_rate")
         if rate_override is None:
             rate_override = body.get("speed")
-        with lock:
-            res = engine.synthesize(
-                text, ref_path,
-                temperature=temperature, top_p=top_p, top_k=top_k,
-                repetition_penalty=repetition_penalty,
-                seed=int(seed) if seed is not None else None,
-                speaking_rate=float(rate_override) if rate_override is not None else None,
-            )
+        res = engine.synthesize(
+            text, ref_path,
+            temperature=temperature, top_p=top_p, top_k=top_k,
+            repetition_penalty=repetition_penalty,
+            seed=int(seed) if seed is not None else None,
+            speaking_rate=float(rate_override) if rate_override is not None else None,
+        )
         dur = res.audio.shape[-1] / res.sample_rate
         meta = {
             "num_mel_codes": res.num_mel_codes,
@@ -110,15 +119,13 @@ def _build_app(model_path: str, device: str) -> FastAPI:
 
     @app.post("/v1/audio/speech")
     async def speech(request: Request):
-        from starlette.concurrency import run_in_threadpool
+        import asyncio
 
         body = await request.json()
         try:
-            # Run the GPU pipeline in a worker thread. The decode loop is
-            # CPU-launch-bound; keeping it off the asyncio event-loop thread
-            # avoids GIL/event-loop contention that otherwise inflates per-step
-            # latency ~1.5x versus a dedicated process.
-            audio, sr, meta = await run_in_threadpool(_synth, body)
+            # Dispatch to the single dedicated, pre-warmed worker thread.
+            loop = asyncio.get_event_loop()
+            audio, sr, meta = await loop.run_in_executor(executor, _synth, body)
         except Exception as e:  # noqa: BLE001
             return JSONResponse(status_code=400, content={"error": str(e)})
 
