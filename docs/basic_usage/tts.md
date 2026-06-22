@@ -28,6 +28,7 @@ uv pip install --no-deps qwen-tts==0.1.1
 | [Qwen3-TTS CustomVoice](../cookbook/qwen3_tts.md) | `examples/configs/qwen3_tts_0_6b_customvoice.yaml` | Text-only requests use the checkpoint speaker table. Missing `voice` defaults to `Vivian` |
 | [Qwen3-TTS VoiceDesign](../cookbook/qwen3_tts.md) | `examples/configs/qwen3_tts_1_7b_voicedesign.yaml` | Requires `task_type="VoiceDesign"` and non-empty `instructions`. No reference audio is required |
 | [MOSS-TTS](../cookbook/moss_tts.md) | `examples/configs/moss_tts.yaml` | Voice cloning via `ref_audio` or `references[0].audio_path` (+ `text`). Duration via `${token:N}` or `token_count`. Benchmark at `--max-concurrency 8` |
+| SpeechifyTTS (simba3 MoE 4B MTL) | `examples/configs/speechify_tts_moe4b.yaml` | Zero-shot voice cloning; requires `ref_audio` or an uploaded voice. 3-stage MoE-AR + DiffiTv3/FlowVAE diffusion vocoder, 24 kHz PCM streaming. Web demo + launch script under `examples/speechify_tts/`. **Model internals (encoder/decoder/vocoder) are an in-progress port; the serving scaffold is in place.** |
 
 ## Launch the Server
 

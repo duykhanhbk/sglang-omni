@@ -1,0 +1,25 @@
+# SpeechifyTTS MoE 4B MTL (simba3) — 3-stage zero-shot voice-cloning TTS.
+#
+#   preprocessing -> tts_engine (MoE AR decoder) -> vocoder (DiffiTv3 + FlowVAE)
+#
+# Launch:
+#   sgl-omni serve --config examples/configs/speechify_tts_moe4b.yaml \
+#       --host 0.0.0.0 --port 8002
+#
+# The checkpoint uses the vllm-omni layout: AR weights live under ar/ and the
+# diffusion vocoder under diffusion/ (the stage factories resolve those subdirs).
+config_cls: SpeechifyTTSPipelineConfig
+model_path: /home/kevin/vllm-omni/vllm_omni/checkpoints/simba3-moe4b-vllm-v5-streaming
+relay_backend: shm
+
+# AR decoder CUDA graphs (full graphs over the MoE decoder; matches the
+# vllm-omni deploy yaml stage-1 enforce_eager: false).
+cuda_graph: true
+cuda_graph_max_bs: 8
+
+# Diffusion vocoder: bucketed denoiser/VAE CUDA graphs, 512-frame KV cache,
+# 4-mel-code streaming chunks (low time-to-first-audio).
+diffusion_cuda_graph: true
+diffusion_kv_cache_frames: 512
+diffusion_chunk_size: 4
+diffusion_min_free_gb: 3.0

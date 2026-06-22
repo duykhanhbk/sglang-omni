@@ -30,6 +30,9 @@ _ARCH_CONFIG_MAP: dict[str, tuple[str, str | None]] = {
     "Qwen3TTSTalker": ("talker_config", None),
     "MossTTSDelaySGLangModel": ("language_config", None),
     "MossTTSLocalSGLangModel": ("language_config", None),
+    # SpeechifyTTS AR engine runs the Gemma-style MoE decoder; SGLang resolves
+    # head/hidden dims and MoE detection from the nested ``decoder_config``.
+    "SpeechifyTTSDecoder": ("decoder_config", None),
 }
 
 
