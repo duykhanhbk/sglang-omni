@@ -39,8 +39,9 @@ LENGTH_LABELS = {
     "long": "LONG  (~530 chars / ~30s audio)",
 }
 
-SGLANG_COLOR = "#2ca02c"   # solid green
-VLLM_COLOR = "#1f77b4"     # dashed blue
+SGLANG_COLOR = "#2ca02c"          # sglang streaming  — solid green
+SGLANG_NOSTREAM_COLOR = "#ff7f0e"  # sglang non-stream — dash-dot orange
+VLLM_COLOR = "#1f77b4"            # vllm-omni baseline — dashed blue
 
 # Summary block regex. Each numeric group is a float (the trailing unit char is
 # matched but not captured).
@@ -155,7 +156,8 @@ def _series(cells: dict, length: str, extractor) -> tuple[list[int], list[float]
 
 # --- plotting ---------------------------------------------------------------
 
-def make_figure(baseline: dict, sglang: dict, out_path: str, dpi: int = 150) -> None:
+def make_figure(series: list[dict], out_path: str, dpi: int = 150) -> None:
+    """``series`` is a list of dicts: {cells, label, color, ls, marker, dy}."""
     nrows = len(LENGTHS)
     ncols = len(PANELS)
     fig, axes = plt.subplots(
@@ -166,23 +168,18 @@ def make_figure(baseline: dict, sglang: dict, out_path: str, dpi: int = 150) -> 
         for c_idx, (title, ylabel, extractor, vfmt) in enumerate(PANELS):
             ax = axes[r][c_idx]
 
-            sx, sy = _series(sglang, length, extractor)
-            bx, by = _series(baseline, length, extractor)
-
-            if bx:
-                ax.plot(bx, by, color=VLLM_COLOR, linestyle="--", marker="s",
-                        markersize=5, linewidth=1.8, label="vllm-omni baseline")
-                for x, y in zip(bx, by):
+            ys_all: list[float] = []
+            for s in series:
+                xs, ys = _series(s["cells"], length, extractor)
+                if not xs:
+                    continue
+                ax.plot(xs, ys, color=s["color"], linestyle=s["ls"], marker=s["marker"],
+                        markersize=5, linewidth=1.8, label=s["label"])
+                for x, y in zip(xs, ys):
                     ax.annotate(vfmt.format(y), (x, y), textcoords="offset points",
-                                xytext=(0, -12), ha="center", fontsize=7,
-                                color=VLLM_COLOR)
-            if sx:
-                ax.plot(sx, sy, color=SGLANG_COLOR, linestyle="-", marker="o",
-                        markersize=5, linewidth=1.8, label="sglang-omni")
-                for x, y in zip(sx, sy):
-                    ax.annotate(vfmt.format(y), (x, y), textcoords="offset points",
-                                xytext=(0, 6), ha="center", fontsize=7,
-                                color=SGLANG_COLOR)
+                                xytext=(0, s["dy"]), ha="center", fontsize=6.5,
+                                color=s["color"])
+                ys_all += ys
 
             ax.set_xscale("log", base=2)
             ax.set_xticks(CONCURRENCIES)
@@ -196,12 +193,10 @@ def make_figure(baseline: dict, sglang: dict, out_path: str, dpi: int = 150) -> 
                 ax.set_xlabel("concurrency", fontsize=8)
             ax.tick_params(labelsize=8)
 
-            # Pad the y-range a little so annotations are not clipped.
-            ys_all = by + sy
             if ys_all:
                 lo, hi = min(ys_all), max(ys_all)
                 span = (hi - lo) or (abs(hi) or 1.0)
-                ax.set_ylim(lo - 0.18 * span, hi + 0.18 * span)
+                ax.set_ylim(lo - 0.22 * span, hi + 0.22 * span)
 
         # Row-group label on the left.
         axes[r][0].annotate(
@@ -211,12 +206,11 @@ def make_figure(baseline: dict, sglang: dict, out_path: str, dpi: int = 150) -> 
         )
 
     handles = [
-        plt.Line2D([0], [0], color=SGLANG_COLOR, linestyle="-", marker="o",
-                   label="sglang-omni"),
-        plt.Line2D([0], [0], color=VLLM_COLOR, linestyle="--", marker="s",
-                   label="vllm-omni baseline"),
+        plt.Line2D([0], [0], color=s["color"], linestyle=s["ls"], marker=s["marker"],
+                   label=s["label"])
+        for s in series
     ]
-    fig.legend(handles=handles, loc="upper center", ncol=2,
+    fig.legend(handles=handles, loc="upper center", ncol=len(handles),
                bbox_to_anchor=(0.5, 0.985), fontsize=11, frameon=True)
 
     fig.suptitle(
@@ -237,28 +231,39 @@ def main():
     p.add_argument("--baseline-dir", default="/tmp/bench_h100/logs_branch022",
                    help="Directory of vllm-omni {length}_c{c}.log files.")
     p.add_argument("--sglang-dir", default=None,
-                   help="Directory of sglang-omni {length}_c{c}.json files "
-                        "(optional; baseline plotted alone if missing).")
+                   help="Directory of sglang-omni STREAMING {length}_c{c}.json cells.")
+    p.add_argument("--sglang-nostream-dir", default=None,
+                   help="Directory of sglang-omni NON-STREAMING {length}_c{c}.json cells.")
     p.add_argument("--out", default="/tmp/bench_h100/compare_sglang_vs_vllm.png")
     p.add_argument("--dpi", type=int, default=150)
     args = p.parse_args()
 
     baseline = load_baseline(args.baseline_dir)
     sglang = load_sglang(args.sglang_dir)
+    sglang_ns = load_sglang(args.sglang_nostream_dir)
 
     expected = len(LENGTHS) * len(CONCURRENCIES)
     print(f"Parsed {len(baseline)}/{expected} baseline cells from {args.baseline_dir}")
-    missing = [f"{l}_c{c}" for l in LENGTHS for c in CONCURRENCIES
-               if (l, c) not in baseline]
-    if missing:
-        print(f"  missing baseline cells: {', '.join(missing)}")
-    print(f"Loaded {len(sglang)}/{expected} sglang cells from "
+    print(f"Loaded {len(sglang)}/{expected} sglang streaming cells from "
           f"{args.sglang_dir or '(none)'}")
+    print(f"Loaded {len(sglang_ns)}/{expected} sglang non-stream cells from "
+          f"{args.sglang_nostream_dir or '(none)'}")
 
-    if not baseline and not sglang:
-        raise SystemExit("No data to plot (no baseline logs and no sglang JSONs).")
+    if not baseline and not sglang and not sglang_ns:
+        raise SystemExit("No data to plot.")
 
-    make_figure(baseline, sglang, args.out, dpi=args.dpi)
+    series = []
+    if sglang:
+        series.append({"cells": sglang, "label": "sglang-omni (streaming)",
+                       "color": SGLANG_COLOR, "ls": "-", "marker": "o", "dy": 7})
+    if sglang_ns:
+        series.append({"cells": sglang_ns, "label": "sglang-omni (non-streaming)",
+                       "color": SGLANG_NOSTREAM_COLOR, "ls": "-.", "marker": "^", "dy": 7})
+    if baseline:
+        series.append({"cells": baseline, "label": "vllm-omni baseline (streaming)",
+                       "color": VLLM_COLOR, "ls": "--", "marker": "s", "dy": -13})
+
+    make_figure(series, args.out, dpi=args.dpi)
     print(f"Wrote {args.out}")
 
 
