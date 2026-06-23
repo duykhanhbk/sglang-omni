@@ -337,22 +337,14 @@ async function generate(){
     if(!resp.ok){ setStatus('Error: ' + (await resp.text()), 'error'); return; }
     SAMPLE_RATE = parseInt(resp.headers.get('X-Sample-Rate') || '24000', 10);
     const serverTTFA = parseFloat(resp.headers.get('X-Server-TTFA') || '0');
-    try {
-      const smHdr = resp.headers.get('X-Speechmarks') || '';
-      speechmarks = smHdr ? JSON.parse(atob(smHdr)) : [];
-    } catch(e){ speechmarks = []; console.warn('speechmarks decode failed', e); }
-    setMetric('m-marks', speechmarks.length.toString());
 
+    // Framed transport: [type:1][len:4 BE][payload].
+    //   A = audio PCM16 LE, M = marks JSON, E = end meta JSON, X = error.
     const reader = resp.body.getReader();
     setStatus('Streaming @ ' + SAMPLE_RATE + ' Hz...', 'playing');
-    while(true){
-      const { done, value } = await reader.read();
-      if(done) break;
-      let merged = new Uint8Array(leftover.length + value.length);
-      merged.set(leftover,0); merged.set(value, leftover.length);
-      const usable = merged.length - (merged.length % 2);
-      const f32 = pcm16ToFloat32(merged.subarray(0, usable));
-      leftover = merged.subarray(usable);
+    let buf = new Uint8Array(0);
+    function onAudioFrame(payload){
+      const f32 = pcm16ToFloat32(payload);
       allSamples.push(f32);
       scheduleChunk(f32);
       totalSamples += f32.length;
@@ -364,6 +356,35 @@ async function generate(){
         setMetric('m-client-ttfa', clientTTFA.toFixed(3)+'s');
         startHighlightLoop();
         firstChunk = false;
+      }
+    }
+    while(true){
+      const { done, value } = await reader.read();
+      if(done) break;
+      let merged = new Uint8Array(buf.length + value.length);
+      merged.set(buf,0); merged.set(value, buf.length);
+      buf = merged;
+      // parse as many complete frames as available
+      while(buf.length >= 5){
+        const type = String.fromCharCode(buf[0]);
+        const dv = new DataView(buf.buffer, buf.byteOffset+1, 4);
+        const len = dv.getUint32(0, false);
+        if(buf.length < 5 + len) break;
+        const payload = buf.subarray(5, 5+len);
+        if(type === 'A'){ onAudioFrame(payload); }
+        else if(type === 'M'){
+          // marks arrive incrementally (one or more words at a time), in order
+          try{ const nm = JSON.parse(new TextDecoder().decode(payload));
+               if(Array.isArray(nm)) speechmarks.push(...nm); }catch(e){}
+          setMetric('m-marks', speechmarks.length.toString());
+        }
+        else if(type === 'E'){
+          try{ const meta = JSON.parse(new TextDecoder().decode(payload));
+               if(meta.num_mel_codes!=null) setMetric('m-marks', (speechmarks.length||0).toString());
+          }catch(e){}
+        }
+        else if(type === 'X'){ setStatus('Error: ' + new TextDecoder().decode(payload), 'error'); }
+        buf = buf.subarray(5+len);
       }
     }
 
@@ -450,7 +471,7 @@ async def tts(request: Request):
 
     sample_rate = resp.headers.get("X-Sample-Rate", str(DEFAULT_SAMPLE_RATE))
     num_codes = resp.headers.get("X-Num-Mel-Codes", "")
-    speechmarks = resp.headers.get("X-Speechmarks", "")
+    stream_format = resp.headers.get("X-Stream-Format", "")
     byte_iter = resp.aiter_bytes().__aiter__()
 
     # Probe the first chunk to measure server-side TTFA.
@@ -475,15 +496,15 @@ async def tts(request: Request):
 
     return StreamingResponse(
         _body(),
-        media_type="audio/pcm",
+        media_type="application/octet-stream",
         headers={
             "X-Sample-Rate": str(sample_rate),
             "X-Channels": "1",
             "X-Bit-Depth": "16",
             "X-Num-Mel-Codes": str(num_codes),
-            "X-Speechmarks": speechmarks,
+            "X-Stream-Format": stream_format or "framed",
             "X-Server-TTFA": f"{server_ttfa:.6f}",
-            "Access-Control-Expose-Headers": "X-Sample-Rate,X-Server-TTFA,X-Num-Mel-Codes,X-Speechmarks",
+            "Access-Control-Expose-Headers": "X-Sample-Rate,X-Server-TTFA,X-Num-Mel-Codes,X-Stream-Format",
         },
     )
 

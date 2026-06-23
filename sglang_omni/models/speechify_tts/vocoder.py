@@ -176,3 +176,218 @@ class SpeechifyVocoder:
 
         audio = self.input_layer.decode(x)  # denormalizes internally -> [1, 1, T*hop]
         return audio.squeeze(1).float()      # [1, T_audio]
+
+    # -- streaming (chunked diffusion + VAE) ------------------------------ #
+    def new_streaming_session(
+        self,
+        speaker_embedding: torch.Tensor,
+        speech_prompt_mels: torch.Tensor | None = None,
+    ) -> "StreamingVocoderSession":
+        """Create a stateful streaming session for incremental vocoding.
+
+        The session keeps the denoiser KV/conv caches, the aligned-encoder
+        KV cache and the FlowVAE decoder conv cache across blocks so audio
+        can be emitted block-by-block (low TTFA) with cross-block
+        continuity — the torch-native equivalent of vllm-omni's
+        ``DiffusionOrchestrator.process_window`` streaming path.
+        """
+        return StreamingVocoderSession(self, speaker_embedding, speech_prompt_mels)
+
+    @torch.inference_mode()
+    def streaming_generate(
+        self,
+        decoder_latents: torch.Tensor,           # [M, F]
+        aligned_encoder_latents: torch.Tensor,   # [M, F]
+        speaker_embedding: torch.Tensor,
+        speech_prompt_mels: torch.Tensor | None = None,
+    ):
+        """Generator yielding audio chunks ``[1, n_samples]`` block-by-block.
+
+        Convenience wrapper around :class:`StreamingVocoderSession` that
+        feeds an already-complete latent sequence in one shot. Used for
+        validation / offline-vs-streaming parity; the engine drives the
+        session incrementally instead.
+        """
+        sess = self.new_streaming_session(speaker_embedding, speech_prompt_mels)
+        sess.push(decoder_latents, aligned_encoder_latents)
+        for chunk in sess.drain():
+            yield chunk
+        tail = sess.finish()
+        if tail is not None and tail.numel() > 0:
+            yield tail
+
+
+def _snapshot_self_conv_cache(pkv):
+    """Snapshot the denoiser self-attention seq length + conv caches so the
+    intermediate ODE steps can be rewound (only the final step's commit
+    sticks). The prompt cross-attention cache is intentionally untouched —
+    it is write-once and shared across steps/blocks."""
+    sa = pkv.self_attention_cache
+    base = sa.get_seq_length(0) if len(sa.layers) > 0 else 0
+    conv = [c.clone() if c is not None else None for c in pkv.conv_cache]
+    return base, conv
+
+
+def _restore_self_conv_cache(pkv, snap) -> None:
+    base, conv = snap
+    sa = pkv.self_attention_cache
+    for layer in sa.layers:
+        if layer.keys is not None and layer.keys.shape[-2] > base:
+            layer.keys = layer.keys[:, :, :base, :].contiguous()
+            layer.values = layer.values[:, :, :base, :].contiguous()
+    pkv.conv_cache = [c.clone() if c is not None else None for c in conv]
+
+
+class StreamingVocoderSession:
+    """Incremental block-wise diffusion + VAE vocoding for one request.
+
+    Usage::
+
+        sess = vocoder.new_streaming_session(spk_emb, prompt_mels)
+        sess.push(decoder_latents_chunk, aligned_enc_chunk)   # repeatable
+        for audio in sess.drain():                            # ready blocks
+            stream(audio)
+        tail = sess.finish()                                  # flush remainder
+
+    Frame bookkeeping (mel-frame space = AR-token space x ``upsample``):
+      * ``commit_frames``  = ``streaming_block_size`` (committed per block)
+      * ``future_frames``  = ``num_future_frames``    (lookahead, recomputed)
+      * window             = ``commit_frames + future_frames`` mel frames
+      * one AR token       = ``upsample`` mel frames
+    """
+
+    def __init__(self, voc: SpeechifyVocoder, speaker_embedding, speech_prompt_mels):
+        from .diffit.diffit_cache_utils import DiffitPastKeyValues
+
+        self.voc = voc
+        self.dev = next(voc.diffit.parameters()).device
+        self.dt = next(voc.diffit.parameters()).dtype
+        self.up = int(voc.diffusion_upsample_factor)
+        self.commit_tokens = max(1, voc.diffit.streaming_block_size // self.up)
+        self.lookahead_tokens = max(0, -(-voc.num_future_frames // self.up))  # ceil
+        self.n_steps = voc.n_diffusion_steps
+        self.out_channels = voc.diffit.output_channels
+
+        # One-time conditioning (prompt encode + speaker timestep cond).
+        prompt_hs = prompt_mask = None
+        if speech_prompt_mels is not None:
+            prompt_hs, prompt_mask = voc.encode_prompt(speech_prompt_mels)
+        self.prompt_hs = prompt_hs
+        self.prompt_mask = prompt_mask
+        if voc._uses_query_pooling and prompt_hs is not None:
+            self.spk = voc.diffit._build_timestep_cond_from_speech_prompt(prompt_hs, prompt_mask)
+        else:
+            self.spk = _normalize_speaker_emb(speaker_embedding.to(self.dev, self.dt))
+
+        # Persistent streaming caches.
+        n_layers = len(voc.diffit.transformer.transformer_blocks)
+        self.denoiser_pkv = DiffitPastKeyValues.create(num_layers=n_layers)
+        self.enc_pkv = None          # DynamicCache, lazily created by the encoder
+        self.vae_cache = None        # dict, created by decode_streaming
+
+        # Latent buffers (accumulate AR latents; consumed block-by-block).
+        self._dec_buf: list[torch.Tensor] = []
+        self._enc_buf: list[torch.Tensor] = []
+        self._n_tokens = 0           # tokens pushed so far
+        self._committed_tokens = 0   # tokens already vocoded/committed
+        self._finished = False
+
+    # -- public API ------------------------------------------------------- #
+    def push(self, decoder_latents: torch.Tensor, aligned_encoder_latents: torch.Tensor) -> None:
+        """Append a chunk of AR latents (``[m, F]``) to the pending buffer."""
+        self._dec_buf.append(decoder_latents.to(self.dev, self.dt))
+        self._enc_buf.append(aligned_encoder_latents.to(self.dev, self.dt))
+        self._n_tokens += int(decoder_latents.shape[0])
+
+    @torch.inference_mode()
+    def drain(self):
+        """Yield audio for every block whose commit+lookahead tokens are ready."""
+        while True:
+            need = self._committed_tokens + self.commit_tokens + self.lookahead_tokens
+            if self._n_tokens < need:
+                return
+            yield self._vocode_block(self.commit_tokens, self.lookahead_tokens, is_last=False)
+
+    @torch.inference_mode()
+    def finish(self) -> torch.Tensor | None:
+        """Flush all remaining committed tokens (no future lookahead)."""
+        if self._finished:
+            return None
+        self._finished = True
+        remaining = self._n_tokens - self._committed_tokens
+        if remaining <= 0:
+            return None
+        return self._vocode_block(remaining, 0, is_last=True)
+
+    # -- internals -------------------------------------------------------- #
+    def _latents(self):
+        dec = torch.cat(self._dec_buf, dim=0) if len(self._dec_buf) > 1 else self._dec_buf[0]
+        enc = torch.cat(self._enc_buf, dim=0) if len(self._enc_buf) > 1 else self._enc_buf[0]
+        # Collapse to a single contiguous tensor to avoid re-concat each block.
+        self._dec_buf = [dec]
+        self._enc_buf = [enc]
+        return dec, enc
+
+    def _vocode_block(self, commit_tokens: int, lookahead_tokens: int, is_last: bool) -> torch.Tensor:
+        voc = self.voc
+        diffit = voc.diffit
+        dec_all, enc_all = self._latents()
+
+        tok0 = self._committed_tokens
+        m_win = commit_tokens + lookahead_tokens
+        tok1 = tok0 + m_win
+        alat = dec_all[tok0:tok1].unsqueeze(0)   # [1, m_win, F]
+        aenc = enc_all[tok0:tok1].unsqueeze(0)   # [1, m_win, F]
+
+        commit_frames = commit_tokens * self.up
+        T_win = m_win * self.up
+        future_frames = lookahead_tokens * self.up
+        frame0 = tok0 * self.up
+
+        # --- aligned encoder (streaming KV cache, one pass per block) ---
+        combined = torch.cat([alat, aenc], dim=-1)                     # [1, m_win, 2F]
+        combined = diffit.input_combined_norm(diffit.input_combined_proj(combined))
+        encoded, self.enc_pkv = diffit.aligned_latent_encoder(
+            inputs_embeds=combined,
+            attention_mask=None,
+            use_cache=True,
+            past_key_values=self.enc_pkv,
+            commit_len=commit_tokens,
+        )                                                              # [1, m_win, F]
+        enc_hs = torch.nn.functional.interpolate(
+            encoded.transpose(1, 2), size=T_win, mode="nearest",
+        )                                                              # [1, F, T_win]
+
+        # --- diffusion ODE (Euler), denoiser self-attn/conv KV cache ---
+        noise = diffit.get_streaming_noise(
+            (1, self.out_channels, frame0 + T_win), self.dev, self.dt,
+        )[..., frame0:frame0 + T_win]
+        x = noise
+        t_span = torch.linspace(0, 1, self.n_steps + 1, device=self.dev, dtype=self.dt)
+        snap = _snapshot_self_conv_cache(self.denoiser_pkv)
+        for step_i in range(self.n_steps):
+            if step_i > 0:
+                _restore_self_conv_cache(self.denoiser_pkv, snap)
+            timestep = t_span[step_i] * torch.ones(1, device=self.dev, dtype=self.dt)
+            v, _ = diffit.forward(
+                hidden_states=x,
+                timestep=timestep,
+                timestep_cond=self.spk,
+                mel_codes_hidden_states=enc_hs,
+                speech_prompt_hidden_states=self.prompt_hs,
+                speech_prompt_attention_mask=self.prompt_mask,
+                conditioning_free=False,
+                cfg_training=False,
+                use_cache=True,
+                past_key_values=self.denoiser_pkv,
+                block_num_frames=commit_frames,
+            )
+            x = x + (t_span[step_i + 1] - t_span[step_i]) * v
+
+        # --- streaming VAE decode (FlowVAE decoder conv cache) ---
+        audio, self.vae_cache = voc.input_layer.decode_streaming(
+            x, cache=self.vae_cache, lookahead=future_frames,
+        )                                                              # [1, 1, commit_frames*hop]
+
+        self._committed_tokens = tok1 - lookahead_tokens
+        return audio.squeeze(1).float()                                # [1, n_samples]

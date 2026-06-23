@@ -102,8 +102,16 @@ async def _generate_one(
     temperature: float,
     seed: int,
     timeout: float,
+    stream: bool = False,
 ) -> dict:
-    """One PCM-streaming request. Returns per-request stats."""
+    """One streaming request. Returns per-request stats.
+
+    With ``stream=False`` the server ships one (post-generation) PCM body and
+    TTFA is effectively the full E2E time. With ``stream=True`` the server uses
+    the *framed* transport (``[type:1][len:4 BE][payload]`` with ``A`` audio,
+    ``M`` marks, ``E`` end), so TTFA is measured from the first **audio** frame
+    and only ``A`` payload bytes count toward the audio duration.
+    """
     import aiohttp
 
     url = api_base.rstrip("/") + "/v1/audio/speech"
@@ -114,6 +122,8 @@ async def _generate_one(
         "temperature": temperature,
         "seed": seed,
     }
+    if stream:
+        body["stream"] = True
 
     async with semaphore:
         nbytes = 0
@@ -127,12 +137,33 @@ async def _generate_one(
                 if resp.status != 200:
                     err = (await resp.text())[:500]
                     return {"success": False, "error": f"HTTP {resp.status}: {err}"}
-                async for chunk in resp.content.iter_any():
-                    if not chunk:
-                        continue
-                    if first_audio_t is None:
-                        first_audio_t = time.perf_counter()
-                    nbytes += len(chunk)
+                if stream:
+                    buf = b""
+                    async for chunk in resp.content.iter_any():
+                        if not chunk:
+                            continue
+                        buf += chunk
+                        while len(buf) >= 5:
+                            ftype = buf[0:1]
+                            length = int.from_bytes(buf[1:5], "big")
+                            if len(buf) < 5 + length:
+                                break
+                            payload = buf[5:5 + length]
+                            buf = buf[5 + length:]
+                            if ftype == b"A":
+                                if first_audio_t is None:
+                                    first_audio_t = time.perf_counter()
+                                nbytes += len(payload)
+                            elif ftype == b"X":
+                                return {"success": False,
+                                        "error": f"stream error: {payload.decode(errors='replace')[:200]}"}
+                else:
+                    async for chunk in resp.content.iter_any():
+                        if not chunk:
+                            continue
+                        if first_audio_t is None:
+                            first_audio_t = time.perf_counter()
+                        nbytes += len(chunk)
         except Exception as e:  # noqa: BLE001
             return {"success": False, "error": f"{type(e).__name__}: {e}"}
 
@@ -185,6 +216,7 @@ async def _run_cell(
             _generate_one(
                 session, args.api_base, text, reference_audio, sem,
                 temperature=args.temperature, seed=args.seed, timeout=args.timeout,
+                stream=args.stream,
             )
             for text in texts
         ]
@@ -321,6 +353,9 @@ def main():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--timeout", type=float, default=300.0)
     p.add_argument("--out", default=None, help="Write a JSON results file (single mode).")
+    p.add_argument("--stream", action="store_true",
+                   help="Use the framed true-streaming transport; measure TTFA "
+                        "from the first audio frame.")
     p.add_argument("--matrix", action="store_true",
                    help="Run {short,medium,long} x {1,2,4,8} sequentially.")
     p.add_argument("--out-dir", default=None,

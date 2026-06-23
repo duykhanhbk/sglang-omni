@@ -283,11 +283,18 @@ class SelfAttention(nn.Module):
                 query_states, key_states, cos, sin
             )
 
+        # Length of cached history (committed frames from prior chunks)
+        # BEFORE this step's update — needed to build the streaming
+        # bottom-right causal mask below.
+        streaming_base_len = 0
+        is_streaming = past_key_values is not None
         if past_key_values is not None:
             cache_kwargs = {"cache_position": cache_position}
             if position_embeddings is not None:
                 cos, sin = position_embeddings
                 cache_kwargs.update({"sin": sin, "cos": cos})
+
+            streaming_base_len = past_key_values.get_seq_length(self.layer_idx)
 
             cl = kwargs.get("commit_len")
             if cl is not None and cl < seq_len:
@@ -322,18 +329,61 @@ class SelfAttention(nn.Module):
         )
         effective_is_causal = self.is_causal and effective_sliding_window is None
 
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=self.attention_dropout if self.training else 0.0,
-            scaling=self.scaling,
-            is_causal=effective_is_causal,
-            softcap=self.attn_logit_softcapping,
-            **kwargs,
-        )
+        if is_streaming and self.is_causal:
+            # Streaming KV-cache self-attention. ``key_states`` is laid out
+            # as ``[history(base) ; window(seq_len)]`` with every position
+            # carrying real data (DynamicCache holds no garbage), so the
+            # logical key index equals the array index ``j`` and query
+            # ``i`` lives at logical position ``base + i``. PyTorch's
+            # ``is_causal=True`` aligns top-left (wrong when q_len != k_len),
+            # so we build the bottom-right causal mask explicitly, widened
+            # by ``sw_future`` for lookahead layers (DiffiTv3 blocks 0/9
+            # have sliding_window=(-1, 32); 0 elsewhere). This mirrors the
+            # vllm-omni static-step mask without the static-slab garbage
+            # bookkeeping.
+            S_total = key_states.shape[2]
+            base = streaming_base_len
+            if effective_sliding_window is not None:
+                left, sw_future = effective_sliding_window
+            else:
+                left, sw_future = -1, 0
+            dtype_min = torch.finfo(query_states.dtype).min
+            j = torch.arange(S_total, device=query_states.device)
+            i = torch.arange(seq_len, device=query_states.device)
+            logical_q = (base + i)[:, None]            # [Q, 1]
+            allowed = j[None, :] <= (logical_q + sw_future)  # [Q, S]
+            if left is not None and left >= 0:
+                allowed = allowed & (j[None, :] >= (logical_q - left))
+            stream_mask = torch.where(
+                allowed,
+                torch.zeros((), dtype=query_states.dtype, device=query_states.device),
+                torch.full((), dtype_min, dtype=query_states.dtype, device=query_states.device),
+            )[None, None, :, :]                        # [1, 1, Q, S]
+            attn_output, attn_weights = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                stream_mask,
+                dropout=0.0,
+                scaling=self.scaling,
+                is_causal=False,
+                softcap=self.attn_logit_softcapping,
+                **kwargs,
+            )
+        else:
+            attn_output, attn_weights = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=self.attention_dropout if self.training else 0.0,
+                scaling=self.scaling,
+                is_causal=effective_is_causal,
+                softcap=self.attn_logit_softcapping,
+                **kwargs,
+            )
 
         attn_output = attn_output.reshape(batch_size, seq_len, -1).contiguous()
         if self.attn_gate:

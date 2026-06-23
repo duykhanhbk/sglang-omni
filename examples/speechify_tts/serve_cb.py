@@ -54,6 +54,9 @@ def _build_app(model_path: str, device: str, max_batch: int) -> FastAPI:
             return path
         return ref
 
+    def _frame(ftype: bytes, payload: bytes) -> bytes:
+        return ftype + len(payload).to_bytes(4, "big") + payload
+
     @app.post("/v1/audio/speech")
     async def speech(request: Request):
         body = await request.json()
@@ -68,6 +71,46 @@ def _build_app(model_path: str, device: str, max_batch: int) -> FastAPI:
         rate = body.get("speaking_rate")
         if rate is None:
             rate = body.get("speed")
+
+        # ---- true streaming (framed): audio blocks ship as the diffusion
+        #      vocoder produces them, overlapping the AR decode (low TTFA) ----
+        if body.get("stream") and (body.get("response_format") or "pcm").lower() == "pcm":
+            out_q = engine.submit_stream(
+                text, ref_path,
+                temperature=float(body.get("temperature", 0.8)),
+                top_p=float(body.get("top_p", 0.8)),
+                top_k=int(body.get("top_k", 10)),
+                repetition_penalty=float(body.get("repetition_penalty", 2.0)),
+                seed=int(body["seed"]) if body.get("seed") is not None else None,
+                speaking_rate=float(rate) if rate is not None else None,
+            )
+
+            async def _frames():
+                loop = asyncio.get_event_loop()
+                while True:
+                    evt = await loop.run_in_executor(None, out_q.get)
+                    if evt is None:
+                        return
+                    kind, data = evt
+                    if kind == "audio":
+                        yield _frame(b"A", data)
+                    elif kind == "marks":
+                        yield _frame(b"M", json.dumps(data, separators=(",", ":")).encode())
+                    elif kind == "final":
+                        yield _frame(b"E", json.dumps(data, separators=(",", ":")).encode())
+                    elif kind == "error":
+                        yield _frame(b"X", str(data).encode())
+                        return
+
+            return StreamingResponse(
+                _frames(), media_type="application/octet-stream",
+                headers={
+                    "X-Sample-Rate": str(engine.sample_rate), "X-Channels": "1",
+                    "X-Bit-Depth": "16", "X-Stream-Format": "framed",
+                    "Access-Control-Expose-Headers": "X-Sample-Rate,X-Channels,X-Bit-Depth,X-Stream-Format",
+                },
+            )
+
         fut = engine.submit(
             text, ref_path,
             temperature=float(body.get("temperature", 0.8)),

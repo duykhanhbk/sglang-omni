@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import queue
+import re
 import threading
 import time
 from concurrent.futures import Future
@@ -67,6 +68,15 @@ def _sample_batch(logits, temp, top_p, top_k, seen, rep_pen, gen):
     return si.gather(1, choice).squeeze(1)                     # [n]
 
 
+_RID_COUNTER = 0
+
+
+def _next_rid() -> int:
+    global _RID_COUNTER
+    _RID_COUNTER += 1
+    return _RID_COUNTER
+
+
 @dataclass
 class _Req:
     text: str
@@ -80,6 +90,9 @@ class _Req:
     max_new_tokens: int = 2048
     future: Future = field(default_factory=Future)
     t_submit: float = 0.0
+    stream: bool = False
+    out_q: object = None              # queue.Queue of streaming events when stream=True
+    rid: int = field(default_factory=_next_rid)
 
 
 @dataclass
@@ -96,6 +109,10 @@ class _Slot:
     aligns: list = field(default_factory=list)
     steps: int = 0
     t_admit: float = 0.0
+    # incremental speechmark state (streaming only)
+    words: list = field(default_factory=list)   # [{value,start,end}]
+    word_ptr: int = 0
+    char_total: int = 1
 
 
 class CBEngine:
@@ -138,6 +155,8 @@ class CBEngine:
         # the (~0.18s) diffusion decode when a slot finishes -- the slot is freed
         # and re-admitted immediately, keeping the GPU decode pipeline full.
         self._vocode_q: "queue.Queue[dict]" = queue.Queue()
+        # Per-request streaming vocoder sessions, owned by the vocode thread.
+        self._sessions: dict = {}
         self._vocode_thread = threading.Thread(target=self._vocode_loop, name="cb-vocode", daemon=True)
         self._vocode_thread.start()
         self._thread = threading.Thread(target=self._loop, name="cb-decode", daemon=True)
@@ -148,6 +167,25 @@ class CBEngine:
         req = _Req(text=text, ref_audio=ref_audio, t_submit=time.perf_counter(), **kw)
         self._queue.put(req)
         return req.future
+
+    def submit_stream(self, text: str, ref_audio, **kw) -> "queue.Queue":
+        """Submit a request for *true* streaming synthesis.
+
+        Returns a ``queue.Queue`` of events; the audio starts flowing as soon
+        as the first diffusion block is vocoded (overlapping the AR decode),
+        giving low time-to-first-audio:
+
+          * ``("audio", pcm16_bytes)``  — one decoded block (mono PCM16 LE)
+          * ``("marks", marks_list)``   — word speechmarks (once AR finishes)
+          * ``("final", meta_dict)``    — num_mel_codes / stop_reason / rate / duration
+          * ``("error", message)``      — synthesis failed
+          * ``None``                    — end sentinel
+        """
+        q: "queue.Queue" = queue.Queue(maxsize=512)
+        req = _Req(text=text, ref_audio=ref_audio, t_submit=time.perf_counter(),
+                   stream=True, out_q=q, **kw)
+        self._queue.put(req)
+        return q
 
     def warmup(self, passes: int = 3) -> None:
         g = torch.Generator().manual_seed(0)
@@ -174,6 +212,48 @@ class CBEngine:
     def _active_slots(self) -> list[int]:
         return [i for i in range(self.max_batch) if self._slots[i] is not None]
 
+    def _emit_marks(self, st: _Slot, align_val: float) -> None:
+        """Emit any word marks whose alignment threshold is now crossed.
+
+        Mirrors :func:`engine._compute_speechmarks` but incrementally: because
+        the per-frame alignment is monotonic, a word's start frame is the first
+        frame whose alignment reaches the word's char-start fraction. Emitting
+        marks as soon as AR commits that frame (well ahead of when the audio
+        plays, since AR runs faster than realtime) lets the UI highlight live
+        from the very first word.
+        """
+        if st.req.out_q is None or not st.words:
+            return
+        frame_idx = len(st.aligns) - 1
+        tl = max(st.text_n_tokens, 1)
+        new = []
+        while st.word_ptr < len(st.words):
+            w = st.words[st.word_ptr]
+            if (align_val / tl) >= (w["start"] / st.char_total):
+                new.append({
+                    "value": w["value"], "startIndex": w["start"], "endIndex": w["end"],
+                    "startTime": int(round(frame_idx * self.frame_dur_ms)),
+                })
+                st.word_ptr += 1
+            else:
+                break
+        if new:
+            st.req.out_q.put(("marks", new))
+
+    def _flush_remaining_marks(self, st: _Slot) -> None:
+        """Flush trailing words whose threshold was never reached (clamped to
+        the final frame, matching the offline speechmark behavior)."""
+        if st.req.out_q is None or st.word_ptr >= len(st.words):
+            return
+        frame_idx = max(len(st.aligns) - 1, 0)
+        t = int(round(frame_idx * self.frame_dur_ms))
+        new = [{
+            "value": w["value"], "startIndex": w["start"], "endIndex": w["end"],
+            "startTime": t,
+        } for w in st.words[st.word_ptr:]]
+        st.word_ptr = len(st.words)
+        st.req.out_q.put(("marks", new))
+
     @torch.inference_mode()
     def _admit(self, b: int, req: _Req) -> None:
         eng = self.eng
@@ -191,6 +271,19 @@ class CBEngine:
             text_n_tokens=th.shape[0], rate=float(rate), gen=None,
             t_admit=time.perf_counter(),
         )
+        if req.stream:
+            # Spin up the streaming vocoder session on the vocode thread so
+            # its caches + cuBLAS handle live entirely on that worker.
+            self._vocode_q.put({
+                "type": "start", "rid": req.rid, "req": req, "spk": spk,
+                "prompt_mels": vf.speech_prompt_mels,
+            })
+            slot = self._slots[b]
+            slot.words = [
+                {"value": m.group().strip(), "start": m.start(), "end": m.end()}
+                for m in re.finditer(r"\S+", req.text)
+            ]
+            slot.char_total = max(len(req.text), 1)
         # prefill the decoder-start token (alignment frozen); KV[b,0] populated
         self.bd.tok[b] = self.cfg.decoder_start_token_id
         self.bd.step(torch.tensor([b], device=self.device))
@@ -206,14 +299,31 @@ class CBEngine:
         slot immediately so the decode loop can admit the next request."""
         st = self._slots[b]
         self._slots[b] = None
+        if st.req.stream:
+            # Incremental path: latents were already pushed + marks streamed
+            # during decode. Flush any trailing words, then queue the tail.
+            self._flush_remaining_marks(st)
+            self._vocode_q.put({
+                "type": "finish", "rid": st.req.rid, "req": st.req,
+                "codes_len": len(st.codes), "rate": st.rate,
+                "stop_reason": stop_reason,
+            })
+            return
         # stack latents now (cheap copy) so the slot's caches can be reused
         latents = torch.stack(st.latents, dim=0) if st.latents else None
         enc = torch.stack(st.enc_latents, dim=0) if st.enc_latents else None
         self._vocode_q.put({
+            "type": "batch",
             "req": st.req, "latents": latents, "enc": enc, "vf": st.vf,
             "codes": st.codes, "aligns": st.aligns, "text_n_tokens": st.text_n_tokens,
             "rate": st.rate, "stop_reason": stop_reason,
         })
+
+    def _to_pcm(self, audio: torch.Tensor) -> bytes:
+        """``[1, n]`` or ``[n]`` float tensor -> mono PCM16 LE bytes."""
+        import numpy as np
+        a = audio.reshape(-1).clamp(-1, 1).cpu().numpy()
+        return (a * 32767.0).astype("<i2").tobytes()
 
     @torch.inference_mode()
     def _vocode_loop(self) -> None:
@@ -222,29 +332,87 @@ class CBEngine:
                 job = self._vocode_q.get(timeout=0.5)
             except queue.Empty:
                 continue
-            req = job["req"]
+            jtype = job.get("type", "batch")
             try:
-                if job["latents"] is not None:
-                    audio = self.eng.vocoder.generate(
-                        job["latents"], job["enc"],
-                        job["vf"].speaker_embedding.to(self.device),
-                        job["vf"].speech_prompt_mels, seed=req.seed,
-                    )[0].float().cpu()
+                if jtype == "start":
+                    sess = self.eng.vocoder.new_streaming_session(
+                        job["spk"], job["prompt_mels"],
+                    )
+                    sess._req = job["req"]
+                    sess._out_samples = 0
+                    self._sessions[job["rid"]] = sess
+                elif jtype == "push":
+                    self._stream_push(job)
+                elif jtype == "finish":
+                    self._stream_finish(job)
                 else:
-                    audio = torch.zeros(0)
-                marks = _compute_speechmarks(
-                    req.text, job["aligns"], job["text_n_tokens"], self.frame_dur_ms)
-                req.future.set_result({
-                    "audio": audio,
-                    "sample_rate": self.sample_rate,
-                    "num_mel_codes": len(job["codes"]),
-                    "stop_reason": job["stop_reason"],
-                    "speaking_rate": job["rate"],
-                    "marks": marks,
-                })
+                    self._vocode_batch(job)
             except Exception as exc:  # noqa: BLE001
-                if not req.future.done():
-                    req.future.set_exception(exc)
+                self._fail_job(job, exc)
+
+    def _fail_job(self, job: dict, exc: Exception) -> None:
+        rid = job.get("rid")
+        if rid is not None and rid in self._sessions:
+            self._sessions.pop(rid, None)
+        req = job.get("req")
+        if req is not None and getattr(req, "stream", False) and req.out_q is not None:
+            req.out_q.put(("error", str(exc)))
+            req.out_q.put(None)
+        elif req is not None and not req.future.done():
+            req.future.set_exception(exc)
+
+    @torch.inference_mode()
+    def _stream_push(self, job: dict) -> None:
+        sess = self._sessions.get(job["rid"])
+        if sess is None:
+            return
+        lat = job["latent"].reshape(1, -1)
+        enc = job["enc"].reshape(1, -1) if job["enc"] is not None else lat
+        sess.push(lat, enc)
+        for chunk in sess.drain():
+            sess._out_samples += int(chunk.shape[-1])
+            sess._req.out_q.put(("audio", self._to_pcm(chunk)))
+
+    @torch.inference_mode()
+    def _stream_finish(self, job: dict) -> None:
+        sess = self._sessions.pop(job["rid"], None)
+        req = job["req"]
+        dur = 0.0
+        if sess is not None:
+            tail = sess.finish()
+            if tail is not None and tail.numel() > 0:
+                sess._out_samples += int(tail.shape[-1])
+                req.out_q.put(("audio", self._to_pcm(tail)))
+            dur = round(sess._out_samples / self.sample_rate, 3)
+        req.out_q.put(("final", {
+            "num_mel_codes": job["codes_len"],
+            "stop_reason": job["stop_reason"],
+            "speaking_rate": job["rate"],
+            "duration_s": dur,
+        }))
+        req.out_q.put(None)
+
+    @torch.inference_mode()
+    def _vocode_batch(self, job: dict) -> None:
+        req = job["req"]
+        if job["latents"] is not None:
+            audio = self.eng.vocoder.generate(
+                job["latents"], job["enc"],
+                job["vf"].speaker_embedding.to(self.device),
+                job["vf"].speech_prompt_mels, seed=req.seed,
+            )[0].float().cpu()
+        else:
+            audio = torch.zeros(0)
+        marks = _compute_speechmarks(
+            req.text, job["aligns"], job["text_n_tokens"], self.frame_dur_ms)
+        req.future.set_result({
+            "audio": audio,
+            "sample_rate": self.sample_rate,
+            "num_mel_codes": len(job["codes"]),
+            "stop_reason": job["stop_reason"],
+            "speaking_rate": job["rate"],
+            "marks": marks,
+        })
 
     def _loop(self) -> None:
         dev = self.device
@@ -343,10 +511,19 @@ class CBEngine:
                 finished.append((b, "eos"))
                 continue
             st.codes.append(nt)
-            st.latents.append(latents[j])
-            if aligned is not None:
-                st.enc_latents.append(aligned[j])
             st.aligns.append(align_list[j])
+            if st.req.stream:
+                # Overlap vocoding: ship this token's latent to the streaming
+                # session immediately (a block is vocoded once enough arrive).
+                self._vocode_q.put({
+                    "type": "push", "rid": st.req.rid,
+                    "latent": latents[j], "enc": aligned[j] if aligned is not None else None,
+                })
+                self._emit_marks(st, align_list[j])
+            else:
+                st.latents.append(latents[j])
+                if aligned is not None:
+                    st.enc_latents.append(aligned[j])
             if align_r_list[j] >= st.text_len + self.bd.stop_offset:
                 finished.append((b, "alignment"))
                 continue
