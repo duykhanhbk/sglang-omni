@@ -33,13 +33,16 @@ from fastapi import FastAPI, Request, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 
-def _build_app(model_path: str, device: str, max_batch: int) -> FastAPI:
+def _build_app(model_path: str, device: str, max_batch: int,
+               vocode_workers: int = 2) -> FastAPI:
     os.environ.setdefault("JAXTYPING_DISABLE", "1")
     from sglang_omni.models.speechify_tts.cb_engine import CBEngine
 
     app = FastAPI(title="SpeechifyTTS Continuous-Batching Server")
-    print(f"[serve_cb] loading engine from {model_path} on {device} (max_batch={max_batch}) ...")
-    engine = CBEngine(model_path, max_batch=max_batch, device=device)
+    print(f"[serve_cb] loading engine from {model_path} on {device} "
+          f"(max_batch={max_batch}, vocode_workers={vocode_workers}) ...")
+    engine = CBEngine(model_path, max_batch=max_batch, device=device,
+                      vocode_workers=vocode_workers)
     print("[serve_cb] warming up ...", flush=True)
     engine.warmup(3)
     print(f"[serve_cb] ready (sample_rate={engine.sample_rate})", flush=True)
@@ -134,7 +137,10 @@ def _build_app(model_path: str, device: str, max_batch: int) -> FastAPI:
 
         marks = res.get("marks") or []
         marks_hdr = _encode_marks(marks)
-        while len(marks) > 8 and len(marks_hdr) > 24000:
+        # HTTP header lines are capped (~8 KB in aiohttp/uvicorn); decimate the
+        # speechmarks until the base64 payload comfortably fits so long prompts
+        # don't trip "Got more than 8190 bytes when reading" on the client.
+        while len(marks) > 8 and len(marks_hdr) > 7000:
             marks = marks[::2]
             marks_hdr = _encode_marks(marks)
 
@@ -185,8 +191,14 @@ def main():
     ap.add_argument("--port", type=int, default=8031)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--max-batch", type=int, default=8)
+    ap.add_argument("--vocode-workers", type=int, default=2,
+                    help="Number of streaming-vocoder worker threads, each on "
+                         "its own CUDA stream. Requests are sharded across them "
+                         "by id so the per-block diffusion forwards overlap; "
+                         "raises high-concurrency streaming throughput.")
     args = ap.parse_args()
-    app = _build_app(args.model_path, args.device, args.max_batch)
+    app = _build_app(args.model_path, args.device, args.max_batch,
+                     vocode_workers=args.vocode_workers)
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 

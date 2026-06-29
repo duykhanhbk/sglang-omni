@@ -20,6 +20,7 @@ which the CUDA-graph layer (``cuda_graph.py``) can capture/replay.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import queue
 import re
@@ -120,7 +121,8 @@ class CBEngine:
 
     def __init__(self, model_path: str, *, max_batch: int = 8, max_dec_len: int = 1024,
                  max_text_len: int = 512, device: str = "cuda", dtype=torch.bfloat16,
-                 use_cuda_graph: bool = True, graph_buckets=(1, 2, 4, 8)):
+                 use_cuda_graph: bool = True, graph_buckets=(1, 2, 4, 8),
+                 vocode_workers: int = 2):
         self.eng = SpeechifyTTSEngine(model_path, device=device, dtype=dtype)
         self.cfg = self.eng.config
         self.device = device
@@ -151,16 +153,41 @@ class CBEngine:
         self._queue: "queue.Queue[_Req]" = queue.Queue()
         self._slots: list[_Slot | None] = [None] * max_batch
         self._stop = False
-        # vocoder runs on its own thread so the decode loop is never blocked by
-        # the (~0.18s) diffusion decode when a slot finishes -- the slot is freed
-        # and re-admitted immediately, keeping the GPU decode pipeline full.
-        self._vocode_q: "queue.Queue[dict]" = queue.Queue()
-        # Per-request streaming vocoder sessions, owned by the vocode thread.
-        self._sessions: dict = {}
-        self._vocode_thread = threading.Thread(target=self._vocode_loop, name="cb-vocode", daemon=True)
-        self._vocode_thread.start()
+
+        # Vocoding runs off the decode loop so the latter is never blocked by the
+        # (~0.18s) diffusion decode. At high concurrency a *single* vocode thread
+        # becomes the throughput ceiling -- every request's blocks serialize
+        # through it. We therefore shard requests across ``vocode_workers``
+        # threads (by request id), each driving its own CUDA stream so the small
+        # per-block diffusion forwards from different requests overlap on the GPU
+        # instead of queueing on one stream. A request's whole lifecycle
+        # (start -> push... -> finish) is pinned to one worker so its stateful
+        # KV/conv caches and cuBLAS handle stay on a single thread; numerics are
+        # unchanged (the streaming noise seed is per-session, worker-independent).
+        self.n_vocode_workers = max(1, int(vocode_workers))
+        self._vocode_qs: list["queue.Queue[dict]"] = [
+            queue.Queue() for _ in range(self.n_vocode_workers)
+        ]
+        # Per-worker streaming vocoder sessions (each rid touched by one worker).
+        self._sessions_list: list[dict] = [{} for _ in range(self.n_vocode_workers)]
+        cuda = str(device).startswith("cuda")
+        self._vocode_streams = [
+            torch.cuda.Stream(device=device) if cuda else None
+            for _ in range(self.n_vocode_workers)
+        ]
+        self._vocode_threads = [
+            threading.Thread(target=self._vocode_loop, args=(w,),
+                             name=f"cb-vocode-{w}", daemon=True)
+            for w in range(self.n_vocode_workers)
+        ]
+        for t in self._vocode_threads:
+            t.start()
         self._thread = threading.Thread(target=self._loop, name="cb-decode", daemon=True)
         self._thread.start()
+
+    def _route(self, rid: int) -> int:
+        """Map a request id to its (fixed) vocode worker."""
+        return rid % self.n_vocode_workers
 
     # ------------------------------------------------------------- public API
     def submit(self, text: str, ref_audio, **kw) -> Future:
@@ -272,9 +299,9 @@ class CBEngine:
             t_admit=time.perf_counter(),
         )
         if req.stream:
-            # Spin up the streaming vocoder session on the vocode thread so
-            # its caches + cuBLAS handle live entirely on that worker.
-            self._vocode_q.put({
+            # Spin up the streaming vocoder session on this request's worker so
+            # its caches + cuBLAS handle live entirely on that thread.
+            self._vocode_qs[self._route(req.rid)].put({
                 "type": "start", "rid": req.rid, "req": req, "spk": spk,
                 "prompt_mels": vf.speech_prompt_mels,
             })
@@ -299,11 +326,12 @@ class CBEngine:
         slot immediately so the decode loop can admit the next request."""
         st = self._slots[b]
         self._slots[b] = None
+        w = self._route(st.req.rid)
         if st.req.stream:
             # Incremental path: latents were already pushed + marks streamed
             # during decode. Flush any trailing words, then queue the tail.
             self._flush_remaining_marks(st)
-            self._vocode_q.put({
+            self._vocode_qs[w].put({
                 "type": "finish", "rid": st.req.rid, "req": st.req,
                 "codes_len": len(st.codes), "rate": st.rate,
                 "stop_reason": stop_reason,
@@ -312,8 +340,8 @@ class CBEngine:
         # stack latents now (cheap copy) so the slot's caches can be reused
         latents = torch.stack(st.latents, dim=0) if st.latents else None
         enc = torch.stack(st.enc_latents, dim=0) if st.enc_latents else None
-        self._vocode_q.put({
-            "type": "batch",
+        self._vocode_qs[w].put({
+            "type": "batch", "rid": st.req.rid,
             "req": st.req, "latents": latents, "enc": enc, "vf": st.vf,
             "codes": st.codes, "aligns": st.aligns, "text_n_tokens": st.text_n_tokens,
             "rate": st.rate, "stop_reason": stop_reason,
@@ -326,34 +354,51 @@ class CBEngine:
         return (a * 32767.0).astype("<i2").tobytes()
 
     @torch.inference_mode()
-    def _vocode_loop(self) -> None:
+    def _vocode_loop(self, w: int) -> None:
+        q = self._vocode_qs[w]
+        sessions = self._sessions_list[w]
+        stream = self._vocode_streams[w]
         while not self._stop:
             try:
-                job = self._vocode_q.get(timeout=0.5)
+                job = q.get(timeout=0.5)
             except queue.Empty:
                 continue
             jtype = job.get("type", "batch")
+            # Each worker drives its own CUDA stream so the small per-block
+            # diffusion forwards from different requests overlap on the GPU.
+            ctx = torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext()
             try:
-                if jtype == "start":
-                    sess = self.eng.vocoder.new_streaming_session(
-                        job["spk"], job["prompt_mels"],
-                    )
-                    sess._req = job["req"]
-                    sess._out_samples = 0
-                    self._sessions[job["rid"]] = sess
-                elif jtype == "push":
-                    self._stream_push(job)
-                elif jtype == "finish":
-                    self._stream_finish(job)
-                else:
-                    self._vocode_batch(job)
+                with ctx:
+                    if stream is not None:
+                        # The decode thread produces this job's GPU inputs
+                        # (latents/spk/prompt) on the default stream. Make this
+                        # worker stream wait for that work (RAW), and tell the
+                        # allocator these blocks are read here so they are not
+                        # recycled while this stream still needs them.
+                        stream.wait_stream(torch.cuda.default_stream())
+                        for v in job.values():
+                            if isinstance(v, torch.Tensor) and v.is_cuda:
+                                v.record_stream(stream)
+                    if jtype == "start":
+                        sess = self.eng.vocoder.new_streaming_session(
+                            job["spk"], job["prompt_mels"],
+                        )
+                        sess._req = job["req"]
+                        sess._out_samples = 0
+                        sessions[job["rid"]] = sess
+                    elif jtype == "push":
+                        self._stream_push(sessions, job)
+                    elif jtype == "finish":
+                        self._stream_finish(sessions, job)
+                    else:
+                        self._vocode_batch(job)
             except Exception as exc:  # noqa: BLE001
-                self._fail_job(job, exc)
+                self._fail_job(sessions, job, exc)
 
-    def _fail_job(self, job: dict, exc: Exception) -> None:
+    def _fail_job(self, sessions: dict, job: dict, exc: Exception) -> None:
         rid = job.get("rid")
-        if rid is not None and rid in self._sessions:
-            self._sessions.pop(rid, None)
+        if rid is not None and rid in sessions:
+            sessions.pop(rid, None)
         req = job.get("req")
         if req is not None and getattr(req, "stream", False) and req.out_q is not None:
             req.out_q.put(("error", str(exc)))
@@ -362,8 +407,8 @@ class CBEngine:
             req.future.set_exception(exc)
 
     @torch.inference_mode()
-    def _stream_push(self, job: dict) -> None:
-        sess = self._sessions.get(job["rid"])
+    def _stream_push(self, sessions: dict, job: dict) -> None:
+        sess = sessions.get(job["rid"])
         if sess is None:
             return
         lat = job["latent"].reshape(1, -1)
@@ -374,8 +419,8 @@ class CBEngine:
             sess._req.out_q.put(("audio", self._to_pcm(chunk)))
 
     @torch.inference_mode()
-    def _stream_finish(self, job: dict) -> None:
-        sess = self._sessions.pop(job["rid"], None)
+    def _stream_finish(self, sessions: dict, job: dict) -> None:
+        sess = sessions.pop(job["rid"], None)
         req = job["req"]
         dur = 0.0
         if sess is not None:
@@ -396,6 +441,12 @@ class CBEngine:
     def _vocode_batch(self, job: dict) -> None:
         req = job["req"]
         if job["latents"] is not None:
+            # speaker_embedding / prompt mels live inside ``vf`` (not top-level
+            # job keys), so protect these cross-stream inputs explicitly.
+            stream = torch.cuda.current_stream() if self.device.startswith("cuda") else None
+            for t in (job["vf"].speaker_embedding, job["vf"].speech_prompt_mels):
+                if stream is not None and isinstance(t, torch.Tensor) and t.is_cuda:
+                    t.record_stream(stream)
             audio = self.eng.vocoder.generate(
                 job["latents"], job["enc"],
                 job["vf"].speaker_embedding.to(self.device),
@@ -515,7 +566,7 @@ class CBEngine:
             if st.req.stream:
                 # Overlap vocoding: ship this token's latent to the streaming
                 # session immediately (a block is vocoded once enough arrive).
-                self._vocode_q.put({
+                self._vocode_qs[self._route(st.req.rid)].put({
                     "type": "push", "rid": st.req.rid,
                     "latent": latents[j], "enc": aligned[j] if aligned is not None else None,
                 })
